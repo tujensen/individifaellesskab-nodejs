@@ -8,11 +8,23 @@ const mysql = require('mysql');
 const config = require('./config');
 const Promise = require('promise');
 
-function debug(msg) {
+/**
+* Debug message and obj.
+*/
+function debug(msg, obj) {
   if (config.debug) {
-    console.log(msg);
+    if (obj) {
+      console.log(msg, obj);
+    }
+    else {
+      console.log(msg);
+    }
   }
 }
+
+/////////////////////////////////////////////
+// web server
+/////////////////////////////////////////////
 
 // Expose public static files.
 app.use(express.static('public'));
@@ -27,6 +39,10 @@ http.listen(config.port, function(){
   debug('listening on *:' + config.port);
 });
 
+/////////////////////////////////////////////
+// database
+/////////////////////////////////////////////
+
 // Setup mysql database connection.
 var connection = mysql.createConnection(config.mysql);
 connection.connect();
@@ -35,50 +51,70 @@ let itemsI = [];
 let itemsWe = [];
 
 /**
- * Load all We data.
- */
-var itemsWePromise = new Promise(function (resolve, reject) {
+* Load all We data.
+*/
+let itemsWePromise = new Promise(function (resolve, reject) {
   connection.query('SELECT * FROM items_we;',
-    function (error, results, fields) {
-      if (error) {
-        reject(error);
-      }
-      else {
-        debug('loaded ' + results.length + ' items_we');
-        itemsWe = results;
-        resolve(results);
-      }
+  function (error, results, fields) {
+    if (error) {
+      reject(error);
     }
-  );
+    else {
+      debug('loaded ' + results.length + ' items_we');
+      itemsWe = results;
+      resolve(results);
+    }
+  }
+);
 });
-var itemsIPromise = new Promise(function (resolve, reject) {
+
+/**
+ * Load all I data.
+ */
+let itemsIPromise = new Promise(function (resolve, reject) {
   connection.query('SELECT * FROM items_i;',
-    function (error, results, fields) {
-      if (error) {
-        reject(error);
-      }
-      else {
-        debug('loaded ' + results.length + ' items_i');
-        itemsI = results;
-        resolve(results);
-      }
+  function (error, results, fields) {
+    if (error) {
+      reject(error);
     }
-  );
+    else {
+      debug('loaded ' + results.length + ' items_i');
+      itemsI = results;
+      resolve(results);
+    }
+  }
+);
 });
 
-let feedsToRead = 0;
+/////////////////////////////////////////////
+// feed reader
+/////////////////////////////////////////////
 
+/**
+ * Has the <title, link> already been added to the bucket.
+ *   or has the title already been added to the bucket within the
+     last config.interval seconds?
+ */
 function alreadyAdded(bucket, title, link) {
   let now = (Math.floor(new Date().getTime() / 1000));
 
-  return bucket.reduce(function (acc, val) {
-    return acc ||
-      (val.link === link && val.title === title) ||
-      (val.title === title && val.timestamp > now - config.interval);
-  });
+  return bucket.find(function (element) {
+    return (element.link === link && element.title === title) ||
+    (element.title === title && element.datetime >= now - config.interval);
+  }) !== undefined;
 }
 
-function handleItem(item) {
+/**
+ * Process the first item in items, and recursively handle items.
+ * When items is empty, call analyseFeeds with remaining urls.
+ */
+function handleItems(urls, items) {
+  if (!items || items.length <= 0) {
+    return analyseFeeds(urls);
+  }
+
+  let item = items.shift();
+
   // Check blacklist.
   let blacklist = false;
   for (index in config.blacklist) {
@@ -90,7 +126,7 @@ function handleItem(item) {
 
   if (blacklist) {
     debug('>> blacklisted: ' + item.link);
-    return;
+    return handleItems(urls, items);
   }
 
   let title = item.title;
@@ -117,13 +153,13 @@ function handleItem(item) {
     bucket = itemsWe;
   }
   else {
-    return;
+    return handleItems(urls, items);
   }
 
   // Avoid link and title combination.
   if (alreadyAdded(bucket, title, item.link)) {
-    debug('** already added: ' + title + ' - ' + item.link);
-    return;
+    debug('* already added: ' + title);
+    return handleItems(urls, items);
   }
 
   // Insert into database.
@@ -133,64 +169,64 @@ function handleItem(item) {
     datetime: (Math.floor(new Date().getTime() / 1000))
   };
 
-  console.log("NEW ITEM", newItem);
-
   let sql = 'INSERT INTO ' + bucketName + ' (title, link, datetime) ' +
-            'VALUES ("' + newItem.title + '", "' + newItem.link + '", ' + newItem.datetime + ');';
+  'VALUES ("' + newItem.title + '", "' + newItem.link + '", ' + newItem.datetime + ');';
 
   connection.query(sql,
     function (error, results, fields) {
       if (error) {
-        console.log(error);
+        console.error(error);
+        return handleItems(urls, items);
       }
       else {
         newItem.id = results.insertId;
+
+        debug("New item inserted", newItem);
+
+        // Insert element in bucket.
+        bucket.push(newItem);
+
+        // Emit updated bucket.
+        io.emit(bucketName, bucket);
+
+        return handleItems(urls, items);
       }
     }
   );
-
-  // Insert element in bucket.
-  bucket.push(newItem);
-
-  // Emit updated bucket.
-  io.emit(bucketName, bucket);
 }
 
-function feedReadFinished() {
-  feedsToRead = feedsToRead - 1;
-
-  if (feedsToRead === 0) {
-    analyseFeeds();
+function analyseFeeds(urls) {
+  if (!urls || urls.length <= 0) {
+    setTimeout( () => {
+      debug('analysing feeds...');
+      analyseFeeds(JSON.parse(JSON.stringify(config.urls)));
+    }, 500);
+    return;
   }
-}
 
-function analyseFeeds() {
-  debug('analysing feeds...');
-  feedsToRead = config.urls.length;
+  // Remove first url from urls.
+  let url = urls.shift();
 
-  config.urls.forEach((url) => {
-    feedparser.parse(url).then( (items) => {
-       items.forEach( (item) => {
-         handleItem(item)
-       });
-     }).catch( (error) => {
-       debug(url);
-       //debug('error: ', error);
-     }).then( () => {
-       feedReadFinished();
-     });
+  debug('next url: ' + url);
+
+  // Parse the url.
+  feedparser.parse(url).then((items) => {
+    handleItems(urls, items);
+  }).catch( (error) => {
+    debug(url, error);
+    analyseFeeds(urls);
   });
 }
 
+// Start the show.
+// Setup socket events after items have been loaded.
 Promise.all([itemsIPromise, itemsWePromise])
-  .then(function (res) {
-    /**
-     * Handle socket connection.
-     */
-    io.on('connection', (socket) => {
-      socket.emit('items_i', itemsI);
-      socket.emit('items_we', itemsWe);
-    });
-
-    setTimeout(analyseFeeds, 5000);
+.then(function (res) {
+  io.on('connection', (socket) => {
+    socket.emit('items_i', itemsI);
+    socket.emit('items_we', itemsWe);
   });
+
+  // Start analysing feeds.
+  setTimeout(analyseFeeds, 5000);
+});
